@@ -2,6 +2,8 @@
 
 基于 `Redis` 的分布式锁, 适用于多 `Worker` 或多服务器共用 `Redis` (单机/集群)服务的场景.
 
+支持阻塞或非阻塞式获取锁.
+
 ## 特征
 
 - **可靠**: 基于 `Redis` 原子操作.
@@ -9,6 +11,8 @@
 - **易用**: 取个锁名, 给定锁过期时间就有了一个业务锁. 可以有无限个互不干扰的锁.
 
 - **获取锁**: 
+
+  - 可选**阻塞**或**非阻塞**式取锁, 均有以下几个方法.
 
   - `Lock()` 常用, 取一次锁.
 
@@ -18,9 +22,9 @@
 
   - `TryLock()` 指定重试次数, 指定重试时间间隔, 直到取锁成功或重试结束.
 
-- **保活锁**: 以锁当前的设定重置其生命周期.
+- **保活锁**: 重置当前锁的生命周期为取锁时设定的值.
 
-- **刷新锁**: 给锁设定一个新的生命周期.
+- **刷新锁**: 更新当前锁的生命周期为指定值, 仅当次锁有效.
 
 - **释放锁**: 锁释放后可立即被重新获取.
 
@@ -55,17 +59,48 @@ lock2.Unlock()
 locker1.Lock(1*time.Second)
 locker1.SafeLock(1*time.Second)
 locker1.TryLock(1*time.Second, 2, 3*time.Millisecond)
+
 // 锁对象获取锁时默认使用锁环境初始化时的锁生命周期
 lock1.Lock()
 lock1.SafeLock()
 lock1.TryLock(2, 3*time.Millisecond)
+
 // 若要更换锁生命周期, 可以使用 Refresh() 方法 (立即生效)
 lock1.Refresh(5*time.Second)
+
 // 若要变更锁的默认生命周期 (下次取锁时生效)
 lock1.SetTTL(8*time.Second).Lock()
 ```
 
-## 示例
+## 阻塞模式取锁
+
+```go
+// 0.5 阻塞模式取锁与上面方法相同, 只是初始化锁环境对象(RedisLocker)时使用方法不同, 如下:
+blockingLocker := redislock.NewBlocking(rdb, "lockB", "lockBLPopList")
+blockingLock, ok := blockingLocker.Lock(10 * time.Millisecond)
+if ok {
+    // 取到锁, 其他协程取锁将被阻塞住
+    fmt.Printf("阻塞式取锁成功.\n  锁名: %s\n  锁生命周期: %s\n  锁对象: %+v\n",
+               blockingLock.Key(), blockingLock.TTL(), blockingLock)
+    // working...
+    // 阻塞模式取锁推荐与主动释放锁搭配使用
+    blockingLock.Unlock()
+} else {
+    // Blocking 超时, 即 Redis.BLPop() 超时
+    // 锁生命周期小于 1 秒时, Blocking 的超时时间等于 1 秒, 否则等于锁生命周期
+    // 当 Blocking 期间获取到锁, 则 ok == true
+}
+```
+
+### 阻塞模式原理
+
+阻塞模式利于 `Redis::List` 的 `BLPop` 实现阻塞, 解锁时 `lpush` 值, 从 `BLPop` 取得值的协程将获取锁.
+
+以下时序图来源于(感谢): https://github.com/ionelmc/python-redis-lock
+
+![redis-lock-blocking](./doc/redis-lock-blocking.png)
+
+## 综合示例
 
 ```go
 // example/main.go
@@ -79,13 +114,13 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-func main() {
-	// Redis 连接 (可与项目共用, 确保连接正确)
-	rdb := redis.NewClient(&redis.Options{
-		Network: "tcp",
-		Addr:    "127.0.0.1:6379",
-	})
+// Redis 连接 (可与项目共用, 确保连接正确)
+rdb := redis.NewClient(&redis.Options{
+    Network: "tcp",
+    Addr:    "127.0.0.1:6379",
+})
 
+func main() {
 	defer func() {
 		_ = rdb.Close()
 	}()
@@ -95,12 +130,13 @@ func main() {
 	// 获取锁时传入锁的过期时间 (生命周期)
 	lock, ok := redislock.New(rdb, "simpleLock").Lock(10 * time.Millisecond)
 	if ok {
-		fmt.Printf("取锁成功.\n  锁名: %s\n  锁生命周期: %s\n  锁对象: %+v\n", lock.Key(), lock.TTL(), lock)
+		fmt.Printf("取锁成功.\n  锁名: %s\n  锁生命周期: %s\n  锁对象: %+v\n",
+			lock.Key(), lock.TTL(), lock)
 	} else {
 		fmt.Printf("失败? 锁对象: %+v\n", lock)
 	}
 
-	// 刷新锁生命周期 (临时更新锁的生命周期)
+	// 刷新锁生命周期 (临时更新锁的生命周期, 当次锁有效)
 	ok = lock.Refresh(1 * time.Hour)
 	fmt.Printf("刷新锁: 成功 == %v, 锁生命周期 > 59m: %s\n", ok, lock.TTL())
 
@@ -116,7 +152,7 @@ func main() {
 		fmt.Printf("锁被占用, 无法获取, 锁生命周期: %s\n", lock.TTL())
 	}
 
-    // 锁占用期, 新建锁对象(锁名相同时)也无法获取到 (其他协程或新建锁对象)
+	// 锁占用期, 新建锁对象(锁名相同时)也无法获取到 (其他协程或新建锁对象)
 	newLock, ok := redislock.New(rdb, "simpleLock").Lock(10 * time.Millisecond)
 	if ok {
 		fmt.Printf("异常? 锁对象: %+v\n", newLock)
@@ -129,7 +165,8 @@ func main() {
 	time.Sleep(lock.TTL())
 	ok = lock.SafeLock()
 	if ok {
-		fmt.Printf("锁过期, 重新取锁成功.\n  锁名: %s\n  锁生命周期: %s\n  锁对象: %+v\n", lock.Key(), lock.TTL(), lock)
+		fmt.Printf("锁过期, 重新取锁成功.\n  锁名: %s\n  锁生命周期: %s\n  锁对象: %+v\n",
+			lock.Key(), lock.TTL(), lock)
 	} else {
 		fmt.Printf("失败? 锁对象: %+v\n", lock)
 	}
@@ -137,8 +174,10 @@ func main() {
 	// 主动释放锁后可立即被重新获取
 	ok = lock.Unlock()
 	if ok {
-		fmt.Printf("主动释放锁: 成功 == %v, 锁生命周期: %s, 锁对象: %+v\n", ok, lock.TTL(), lock)
-		fmt.Printf("重新获取锁: 成功 == %v, 锁生命周期: %s, 锁对象: %+v\n", lock.Lock(), lock.TTL(), lock)
+		fmt.Printf("主动释放锁: 成功 == %v, 锁生命周期: %s, 锁对象: %+v\n",
+			ok, lock.TTL(), lock)
+		fmt.Printf("重新获取锁: 成功 == %v, 锁生命周期: %s, 锁对象: %+v\n",
+			lock.Lock(), lock.TTL(), lock)
 	} else {
 		fmt.Printf("失败? 锁对象: %+v\n", lock)
 	}
@@ -151,14 +190,14 @@ func main() {
 		fmt.Printf("失败? 锁生命周期: %s, 锁对象: %+v\n", lock.TTL(), lock)
 	}
 
-	// 设置非法锁生命周期 (禁止使用负数)
-	errLock, ok := redislock.New(rdb, "TestErrTTL").Lock(-1 * time.Second)
+	// 设置非法锁生命周期 (禁止使用小于 1 毫秒的生命周期)
+	errLock, ok := redislock.New(rdb, "testErrTTL").Lock(999 * time.Microsecond)
 	if ok {
 		fmt.Printf("异常? 锁生命周期: %s, 锁对象: %+v\n", errLock.TTL(), errLock)
 	} else {
 		fmt.Printf("非法生命周期值无法获得锁: %+v\n", errLock)
 		ok = errLock.SetTTL(2 * time.Second).Lock()
-		fmt.Printf("  SetTTL() 重设锁后获取成功: %v, %+v\n", ok, errLock)
+		fmt.Printf("  SetTTL() 重设锁生命周期后取锁成功: %v, %+v\n", ok, errLock)
 	}
 
 	// 2. 通常使用场景
@@ -167,10 +206,10 @@ func main() {
 	// 3. 模拟定时任务场景
 	// timeoutLock()
 
-	// 4. 模拟必须任务执行完成才让出锁的场景
-	// keepaliveLock()
+	// 4. 阻塞模式, 模拟必须任务执行完成才让出锁的场景
+	// keepaliveBlockingLock()
 
-	fmt.Println("the end.")
+	fmt.Println("the end...详见: example/main.go")
 }
 ```
 

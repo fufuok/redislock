@@ -13,16 +13,77 @@ import (
 )
 
 var (
-	rdb       *redis.Client
-	ctx       = context.Background()
-	myLocker  *RedisLocker
-	myLockKey = "TestRedisLock"
-	myLockTTL = 10 * time.Millisecond
+	rdb               *redis.Client
+	ctx               = context.Background()
+	myLocker          *RedisLocker
+	myBlockingLocker  *RedisLocker
+	myLockKey         = "testRedisLock"
+	myLockKeyBlocking = "testRedisLockBlocking"
+	myLockTTL         = 10 * time.Millisecond
 )
+
+func TestRedisLock_Blocking(t *testing.T) {
+	Convey("阻塞取锁测试", t, func() {
+		So(setup(), ShouldBeTrue)
+
+		// 初始化锁环境
+		myBlockingLocker = NewBlocking(rdb, myLockKey, myLockKeyBlocking)
+
+		Convey("30 协程同时抢锁, 每个协程都能抢到 1 次", func() {
+			n := 0
+			wg := &sync.WaitGroup{}
+
+			for i := 1; i <= 20; i++ {
+				wg.Add(1)
+
+				// 锁生命周期小于 1 秒, 阻塞模式工作正常
+				myLock := myBlockingLocker.New(20 * time.Millisecond)
+
+				go func(i int) {
+					defer wg.Done()
+
+					ok := myLock.Lock()
+					if ok {
+						n += i
+						time.Sleep(5 * time.Millisecond)
+						myLock.Unlock()
+					}
+				}(i)
+			}
+
+			for i := 21; i <= 30; i++ {
+				wg.Add(1)
+				myLock := myBlockingLocker.New(1 * time.Second)
+
+				go func(i int) {
+					defer wg.Done()
+
+					ok := myLock.Lock()
+					if ok {
+						n += i
+						time.Sleep(5 * time.Millisecond)
+						myLock.Unlock()
+					}
+				}(i)
+			}
+
+			wg.Wait()
+
+			So(n, ShouldEqual, 465)
+		})
+
+		Reset(func() {
+			teardown()
+		})
+	})
+}
 
 func TestRedisLock(t *testing.T) {
 	Convey("初始化锁(默认锁生命周期: 10ms)", t, func() {
 		So(setup(), ShouldBeTrue)
+
+		// 初始化锁环境
+		myLocker = New(rdb, myLockKey)
 
 		Convey("锁占用期内无法被再次获取", func() {
 			myLock, ok := myLocker.Lock(myLockTTL * 10)
@@ -157,7 +218,7 @@ func TestRedisLock(t *testing.T) {
 		})
 
 		Convey("设置非法的锁生命周期", func() {
-			myLock, ok := myLocker.Lock(-1 * time.Millisecond)
+			myLock, ok := myLocker.Lock(999 * time.Microsecond)
 			So(ok, ShouldBeFalse)
 
 			// 非法锁, 无法刷新生命周期
@@ -217,9 +278,6 @@ func setup() bool {
 		Network: "tcp",
 		Addr:    "127.0.0.1:6379",
 	})
-
-	// 初始化锁环境
-	myLocker = New(rdb, myLockKey)
 
 	return rdb.Ping(ctx).Val() == "PONG"
 }

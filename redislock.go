@@ -18,6 +18,11 @@ var (
 	`)
 	lockUnlock = redis.NewScript(`
 			if redis.call("get", KEYS[1]) == ARGV[1] then
+				if KEYS[2] ~= "" then
+					redis.call("del", KEYS[2])
+					redis.call("lpush", KEYS[2], 1)
+					redis.call("expire", KEYS[2], ARGV[2])
+				end
 				return redis.call("del", KEYS[1])
 			else
 				return 0
@@ -25,28 +30,35 @@ var (
 	`)
 )
 
-// 锁公共项
+// 锁公共项: Redis 连接, context, 锁名, 阻塞键名, 阻塞超时时间
 type RedisLocker struct {
-	rdb *redis.Client
-	ctx context.Context
-	key string
+	rdb  *redis.Client
+	ctx  context.Context
+	key  string
+	keyB string
+	ttlB time.Duration
 }
 
-// 锁标识
+// 锁标识: 锁环境, 锁随机值, 锁生命周期
 type RedisLock struct {
 	locker *RedisLocker
 	value  string
 	ttl    time.Duration
 }
 
-// 新建锁环境, 默认使用 context.Background()
+// 新建锁环境, 默认非阻塞, 使用 context.Background()
 func New(rdb *redis.Client, key string) *RedisLocker {
-	return CTXNew(rdb, context.Background(), key)
+	return CTXNew(rdb, context.Background(), key, "")
+}
+
+// 新建锁环境, 默认阻塞, 使用 context.Background()
+func NewBlocking(rdb *redis.Client, key, keyB string) *RedisLocker {
+	return CTXNew(rdb, context.Background(), key, keyB)
 }
 
 // 新建锁环境
-func CTXNew(rdb *redis.Client, ctx context.Context, key string) *RedisLocker {
-	return &RedisLocker{rdb: rdb, ctx: ctx, key: key}
+func CTXNew(rdb *redis.Client, ctx context.Context, key string, keyB string) *RedisLocker {
+	return &RedisLocker{rdb: rdb, ctx: ctx, key: key, keyB: keyB}
 }
 
 // 新建空锁
@@ -66,15 +78,37 @@ func (c *RedisLocker) SafeLock(ttl time.Duration) (*RedisLock, bool) {
 
 // 多次尝试获取锁
 func (c *RedisLocker) TryLock(ttl time.Duration, retry int, retryDelay time.Duration) (*RedisLock, bool) {
-	value := xid.New().String()
+	if ttl < time.Millisecond {
+		return c.New(ttl), false
+	}
 
+	if c.keyB != "" {
+		// 阻塞模式, BLPop 最小超时为 1 秒
+		if ttl < time.Second {
+			c.ttlB = time.Second
+		} else {
+			c.ttlB = ttl
+		}
+	}
+
+	value := xid.New().String()
 	for i := 0; i <= retry; i++ {
 		// SET key value EX|PX 10 NX
 		if c.rdb.SetNX(c.ctx, c.key, value, ttl).Val() {
+			if c.keyB != "" {
+				c.rdb.Del(c.ctx, c.keyB)
+			}
 			return &RedisLock{c, value, ttl}, true
 		}
 		if retryDelay > 0 {
 			time.Sleep(retryDelay)
+		}
+	}
+
+	if c.keyB != "" {
+		if v := c.rdb.BLPop(c.ctx, c.ttlB, c.keyB).Val(); len(v) > 1 && v[1] == "1" {
+			// 获取到数据时尝试取锁
+			return c.TryLock(ttl, retry, retryDelay)
 		}
 	}
 
@@ -93,7 +127,7 @@ func (l *RedisLock) Lock() bool {
 
 // 重新获取锁 (安全模式, 重试 2 次)
 func (l *RedisLock) SafeLock() bool {
-	return l.TryLock(2, 1*time.Microsecond)
+	return l.TryLock(2, time.Microsecond)
 }
 
 // 重新多次尝试获取锁 (指定重试时间间隔)
@@ -109,7 +143,8 @@ func (l *RedisLock) TryLock(retry int, retryDelay time.Duration) bool {
 // 释放锁
 func (l *RedisLock) Unlock() bool {
 	if l.value != "" {
-		ok, _ := lockUnlock.Run(l.locker.ctx, l.locker.rdb, []string{l.locker.key}, l.value).Bool()
+		ok, _ := lockUnlock.Run(l.locker.ctx, l.locker.rdb,
+			[]string{l.locker.key, l.locker.keyB}, l.value, int64(l.locker.ttlB/time.Second)).Bool()
 		if ok {
 			l.value = ""
 			return true
